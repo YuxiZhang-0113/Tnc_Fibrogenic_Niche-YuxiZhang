@@ -143,7 +143,7 @@ spaCellChat <- function(sem,
     
     #scalefactor
     scalefactors = jsonlite::fromJSON(txt = file.path(dirname(sem@tools$Staffli@imgs), "scalefactors_json.json"))
-    spot.size = 65        #10X Visium spot大小为55μm，两个spot之间Gap为10μm
+    spot.size = 65 
     conversion.factor = spot.size/scalefactors$spot_diameter_fullres
     spatial.factors = data.frame(ratio = conversion.factor, tol = spot.size/2)
     
@@ -191,7 +191,7 @@ spaCellChat <- function(sem,
     cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "net")
     cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
     
-    df.net <- subsetCommunication(cellchat)  #配受体对
+    df.net <- subsetCommunication(cellchat) 
     df.netP <- subsetCommunication(cellchat, slot.name = "netP")
     
     return(list(cellchat = cellchat,
@@ -294,7 +294,7 @@ saveRDS(object = objects_list,file = "~/TNC/VisiumUUO/VisiumUUO.rds")
 ```{r}
 scRNA <- readRDS("~/TNC/scRNA_UUO/UUO.rds") # Pre-annotated UUO scRNA-seq Reference
 
-###反卷积
+### Deconvolution
 objects_list <- readRDS("~/TNC/VisiumUUO/VisiumUUO.rds")
 TNC_elements <- objects_list$spatial_each_sem
 semMerged <- objects_list$se
@@ -321,3 +321,4 @@ singlet::RankPlot(nmf, reduction = "nmf")
 DotPlot(object_integrated,features = colnames(object_integrated@reductions[["nmf"]]@cell.embeddings),group.by = "region")+
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 ```
+
