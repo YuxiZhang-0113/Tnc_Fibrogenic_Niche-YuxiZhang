@@ -1,0 +1,344 @@
+---
+title: "03scRNA_processing"
+author: "Yuxi Zhang"
+date: "2025-08-09"
+output: html_document
+---
+
+## Single-cell RNA Data Processing of UIRI and UUO Models
+
+### 1. Processing of UIRI Data
+#### 1) scRNA Data Preprocessing
+
+```{r}
+samples <- c("sham_1","sham_2", "UIRI_10D_1","UIRI_10D_2")
+dir <- paste("~/TNC/scRNA_UIRI",samples[i],sep = "/")
+
+st <- list()
+for (i in 1:length(samples)) {
+  path <- dir[i]
+  sample_name <- samples[i]
+  
+  sce <- CreateSeuratObject(counts = Read10X(path),min.cells=3)
+  sce <- add_meta(sce = sce, species = "mouse")
+  
+  sce <- subset(sce, subset = nFeature_RNA > 600 & nFeature_RNA < 7000 & percent.mt < 50 & percent.rp < 50)
+  
+  sce$sample <- sample_name
+  st[[sample_name]] <- sce
+}
+
+sce_merge <- merge(st[[1]],st[2:4])
+
+
+# Calculation of Contaminated Genes and Doublets
+dt <- list()
+for (i in 1:length(samples)) {
+  path <- dir[i]
+  sample_name <- samples[i]
+  
+  sce.all <- CreateSeuratObject(counts = Read10X(path))
+  tod <- sce.all@assays$RNA@counts 
+  sce.all_filter <- subset(sce_merge, subset = sample %in% samples[i])
+  toc <- sce.all_filter@assays$RNA@counts 
+  out <- run_soupx(toc= toc,tod = tod)
+  
+  sce <- CreateSeuratObject(out)
+  
+  sce <- add_meta(sce = sce, species = "mouse")
+  sce$sample <- sample_name
+  
+  sce <- rundoublet(sce, method = "doubletfinder", basis = "10X") 
+  
+  dt[[sample_name]] <- sce
+}
+
+sce <- merge(dt[[1]],dt[2:4])
+sce <- subset(sce, subset = Is_Double == "singlet")
+```
+
+#### 2) Dimensionality Reduction and Clustering
+
+```{r}
+sce <- sce %>%
+  Seurat::NormalizeData(verbose = FALSE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData()
+
+
+sce <- RunPCA(sce,npcs = 20, verbose = FALSE)
+ElbowPlot(sce)
+
+sce <- RunHarmony(object = sce, group.by.vars = 'sample')
+sce <- FindNeighbors(sce, reduction = "harmony", dims = 1:20)
+sce <- FindClusters(sce, resolution = 0.8)
+
+sce <- RunUMAP(sce, reduction = "harmony", dims = 1:20)
+sce <- RunTSNE(sce, reduction = "harmony", dims = 1:20)
+saveRDS(sce,file = ('~/TNC/scRNA_UIRI/sce_ann.rds'))
+```
+
+#### 3) CellChat for Cell-Cell Communication Analysis
+
+```{r}
+scCellChat <- function(sce,
+                          myident,
+                          species, 
+                          type ="triMean",  trim = 0.1,
+                          interaction.range = 250,
+                          distance.use = TRUE, 
+                          scale.distance = 0.01,
+                          contact.dependent.forced = FALSE,
+                          contact.dependent = TRUE,
+                          contact.range = 100,
+                          mincell = 10){
+    library(CellChat)
+    library(Seurat)
+    library(tidyverse)
+    library(patchwork)
+    library(dplyr)
+    
+    sce$celltype <- sce@meta.data[,myident]
+    if (is.factor(sce$celltype)) {
+      sce$celltype <- droplevels(sce$celltype)
+    }
+    Idents(sce) <- "celltype"
+
+    #count meta
+    data.input = GetAssayData(sce, layer = "data") 
+    meta = data.frame(labels = Idents(sce),row.names = names(Idents(sce)))
+    
+    interaction_input <- read.csv(file = "~/TNC/database/interaction_input_CellChatDB.csv", row.names = 1)
+    complex_input <- read.csv(file = "~/TNC/database/complex_input_CellChatDB.csv", row.names = 1)
+    cofactor_input <- read.csv(file = "~/TNC/database/cofactor_input_CellChatDB.csv", row.names = 1)
+    geneInfo <- read.csv(file = "~/TNC/database/geneInfo_input_CellChatDB.csv", row.names = 1)
+    CellChatDB <- list()
+    CellChatDB$interaction <- interaction_input
+    CellChatDB$complex <- complex_input
+    CellChatDB$cofactor <- cofactor_input
+    CellChatDB$geneInfo <- geneInfo
+    CellChatDB.mouse <- CellChatDB
+    
+    #createCellChat
+    cellchat <- createCellChat(object = data.input, 
+                               meta = meta, 
+                               group.by = "labels")
+    
+    CellChatDB <- CellChatDB.mouse 
+    cellchat@DB <- CellChatDB
+    
+    
+    cellchat <- subsetData(cellchat)
+    
+    future::plan("sequential") 
+    
+    cellchat <- identifyOverExpressedGenes(cellchat)
+    cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = F)
+    
+    cellchat <- computeCommunProb(cellchat, type = type, 
+                                  trim = trim,
+                                  distance.use = distance.use, 
+                                  interaction.range = interaction.range, 
+                                  scale.distance = scale.distance,
+                                  contact.dependent = contact.dependent, 
+                                  contact.range = contact.range)
+    
+    cellchat <- filterCommunication(cellchat, min.cells = mincell)
+    cellchat <- computeCommunProbPathway(cellchat)
+    cellchat <- aggregateNet(cellchat)
+    cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "net")
+    cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+    
+    df.net <- subsetCommunication(cellchat) 
+    df.netP <- subsetCommunication(cellchat, slot.name = "netP")
+    
+    return(list(cellchat = cellchat,
+                df.net = df.net,
+                df.netP = df.netP))
+}
+
+sce <- readRDS("~/TNC/scRNA_UIRI/sce_ann.rds")
+cellchat_list <- scCellChat(sce, myident = "celltype", species = "mouse")
+
+```
+
+### 2. Processing of Sox9_IRI Data
+#### 1) scRNA Data Preprocessing
+
+```{r}
+dn <- c('~/TNC/GSE196929_IRIsox9/IRI10D1/outs/filtered_feature_bc_matrix',
+        '~/TNC/GSE196929_IRIsox9/IRI10D2/outs/filtered_feature_bc_matrix',
+        '~/TNC/GSE196929_IRIsox9/IRI10D3/outs/filtered_feature_bc_matrix')
+samples <- c("IRI10D1","IRI10D2","IRI10D3")
+st<-list()
+
+for (i in 1:length(dn)){
+  path <- dn[i]
+  sample_name <- samples[i]
+  sce <- CreateSeuratObject(counts = Read10X(path),project = samples[i])
+  sce <- add_meta(sce = sce, species = "mouse")
+  sce <- subset(sce,subset = nFeature_RNA > 400 & nFeature_RNA < 7000 & percent.mt < 30 & percent.rp < 30 & log10GenesPerUMI > 0.8)
+  sce <- rundoublet(sce,method = "doubletfinder",basis = "10X",custom_rate = NULL,assay= "RNA")
+  sce$orig.ident <- sample_name
+  st[[samples[i]]] <- sce
+}
+
+sce <- scCustomize::Merge_Seurat_List(st,add.cell.ids = names(st))
+sce <- JoinLayers(sce)
+sce$sample <- sce$orig.ident
+sce <- subset(sce, subset = Is_Double== "Singlet")
+```
+
+#### 2) Dimensionality Reduction and Clustering
+
+```{r}
+sce <- Seurat::NormalizeData(sce, verbose = FALSE)
+sce <- FindVariableFeatures(sce, selection.method = "vst", nfeatures = 2000)
+sce <- ScaleData(sce)
+sce <- RunPCA(sce,npcs =20, verbose = FALSE)
+sce <- RunHarmony(object = sce, group.by.vars = 'sample')
+sce <- FindNeighbors(sce, reduction = "harmony", dims = 1:20)
+sce <- FindClusters(sce, resolution = 0.8)
+sce <- RunUMAP(sce, reduction = "harmony", dims = 1:20)
+sce <- RunTSNE(sce, reduction = "harmony", dims = 1:20)
+```
+
+#### 3) Celltype Annotation
+
+```{r}
+sce.markers <- FindAllMarkers(sce, only.pos = TRUE, min.pct = 0.25, logfc.threshold = log2(1.5))
+
+sce$celltype <- plyr::mapvalues(sce$seurat_clusters,
+                                from = 0:26 ,
+                                to = c("Macro","Macro","Macro","PTS1","Capillary",  
+                                       "CNT", "ALOH", "PTS2", "Fib", "PC",
+                                       "DLOH", "Neu", "DT", "Macro", "ALOH", 
+                                       "Capillary", "unknown", "IC", "DC", "Glomerular", 
+                                       "Arterial", "T", "Cycling", "SMC", "Podo", 
+                                       "Mesa", "IC"))  
+
+sce_list <- list(sce = sce,
+                 marker = sce.markers)
+saveRDS(sce_list,file = "~/TNC/scRNA_IRIsox9/scRNA_IRIsox9.rds")
+```
+
+
+### 3. Processing of UUO Data
+#### 1) scRNA Data Preprocessing
+
+```{r}
+dn <- c(
+  "~/TNC/GSE175412_UUO/Sham1/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO10D1/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO10D2/outs/filtered_feature_bc_matrix",
+  
+  "~/TNC/GSE175412_UUO/UUO7D1/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO7D2/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO7D3/outs/filtered_feature_bc_matrix",
+  
+  "~/TNC/GSE175412_UUO/Sham2/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/Sham3/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/Sham4/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/Sham5/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/Sham6/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO28D1/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO28D2/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO28D3/outs/filtered_feature_bc_matrix",
+  
+  "~/TNC/GSE175412_UUO/Sham7/outs/filtered_feature_bc_matrix",
+  "~/TNC/GSE175412_UUO/UUO7D4/outs/filtered_feature_bc_matrix")
+
+samples <- c("Sham1",
+             "UUO10D1",
+             "UUO10D2",
+             
+             "UUO7D1",
+             "UUO7D2",
+             "UUO7D3",
+             
+             "Sham2",
+             "Sham3",
+             "Sham4",
+             "Sham5",
+             "Sham6",
+             "UUO28D1",
+             "UUO28D2",
+             "UUO28D3",
+             
+             "Sham7",
+             "UUO7D4")
+
+dt <- data.frame(dir = dn, sample = samples)
+
+st <- list()
+for (i in 1:nrow(dt)) {
+  path <- dt$dir[i]
+  sample_name <- dt$sample[i]
+  
+  sce <- CreateSeuratObject(counts = Read10X(path))
+  sce <- add_meta(sce = sce, species = "mouse")
+  
+  sce <- subset(sce, subset = nFeature_RNA > 400 & nFeature_RNA < 6000 & nCount_RNA < 15000 & percent.mt < 30 & percent.hb < 10 & 
+                  percent.rp < 30 & log10GenesPerUMI > 0.8)
+  
+  sce <- rundoublet(sce,method = "scdblfinder")  
+
+  sce$sample <- sample_name
+  st[[sample_name]] <- sce
+}
+
+sce <- scCustomize::Merge_Seurat_List(st,add.cell.ids = names(st))
+sce <- JoinLayers(sce)
+sce <- subset(sce, subset = scDblFinder_class == "singlet")
+```
+
+#### 2) Dimensionality Reduction and Clustering
+
+```{r}
+sce <- sce %>%
+  Seurat::NormalizeData(verbose = FALSE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData()
+
+
+sce <- RunPCA(sce,npcs = 20, verbose = FALSE)
+ElbowPlot(sce)
+
+sce <- RunHarmony(object = sce, group.by.vars = 'sample')
+sce <- FindNeighbors(sce, reduction = "harmony", dims = 1:20)
+sce <- FindClusters(sce, resolution = 0.8)
+
+sce <- RunUMAP(sce, reduction = "harmony", dims = 1:20)
+sce <- RunTSNE(sce, reduction = "harmony", dims = 1:20)
+
+```
+
+#### 3) Celltype Annotation
+
+```{r}
+all.cluster.markers <- FindAllMarkers(object = sce,only.pos = FALSE,min.pct = 0.25,logfc.threshold = log2(1.5))
+
+sce$celltype <- plyr::mapvalues(sce$seurat_clusters,
+                                from = 0:32 ,
+                                to = c("MA","T","PTS1S2","DLOH","DC","PTS2S3",
+                                       "ALOH","PC","PTS3","Glomerular","B","CNT",
+                                       "Capillary","Podo","Arterial","PTS1","IC","MA",
+                                       "SMC","Fib","Capillary","DT","DC","DLOH",
+                                       "Cycling","Neu","Mesa","InjPT","PEC","NK",
+                                       "Cycling","delete","delete"))
+sce <- subset(sce,celltype != "delete")
+
+sce$group <- plyr::mapvalues(sce$sample,
+                             from = c("Sham1", "Sham2", "Sham3", "Sham4", "Sham5", "Sham6", "Sham7",
+                                      "UUO10D1", "UUO10D2", "UUO28D1", "UUO28D2", "UUO28D3",
+                                      "UUO7D1", "UUO7D2", "UUO7D3", "UUO7D4"),
+                             to = c("Sham", "Sham", "Sham", "Sham", "Sham", "Sham", "Sham",
+                                    "UUO10D", "UUO10D", "UUO28D", "UUO28D", "UUO28D",
+                                    "UUO7D", "UUO7D", "UUO7D", "UUO7D"))
+
+
+saveRDS(sce,file = "~/TNC/scRNA_UUO/UUO.rds")
+```
+
+
+

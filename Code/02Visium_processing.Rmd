@@ -1,0 +1,323 @@
+---
+title: "02Visium_processing"
+author: "Yuxi Zhang"
+date: "2025-08-09"
+output: html_document
+---
+
+## Spatial Data Processing of UIRI and UUO Models
+
+### 1. Processing of UIRI Data
+#### 1) Visium Data Preprocessing
+```{r}
+path <- c("~TNC/Visium/UIRI/Sham2",
+          "~TNC/Visium/UIRI/10D3")
+sample <- c("Sham","UIRI")
+
+spatial_each_sem <- list()
+for (i in 1:length(path)) {
+  sem <- read_10x_with_semla(path = path[i],sample_names = sample[i])
+  sem <- semla::SubsetSTData(sem, nFeature_Spatial > 1000)
+  sem <- spfunction(sem)
+  spatial_each_sem[[sample[i]]] <- sem
+}
+
+sem_list <- list()
+for (i in seq_along(path)) {
+  sem <- read_10x_with_semla(path = path[i], sample_names = sample[i])
+  sem <- SubsetSTData(sem, nFeature_Spatial > 1000)
+  
+  sem <- NormalizeData(sem, verbose = FALSE)
+  sem <- FindVariableFeatures(sem, verbose = FALSE)
+  
+  sem_list[[sample[i]]] <- sem
+}
+anchors <- FindIntegrationAnchors(object.list = sem_list, dims = 1:10)
+object_integrated <- IntegrateData(anchorset = anchors, dims = 1:10)
+object_integrated <- ScaleData(object_integrated, verbose = FALSE)
+object_integrated <- RunPCA(object_integrated, verbose = FALSE)
+object_integrated <- RunUMAP(object_integrated, dims =1:10)
+object_integrated <- FindNeighbors(object_integrated, reduction = "pca", dims = 1:10)
+object_integrated <- FindClusters(object_integrated, verbose = FALSE, resolution = 1.2)
+object_integrated <- RunTSNE(object_integrated,dims = 1:10)
+
+```
+
+#### 2) Region Annotation
+
+```{r}
+st.marker <- FindAllMarkers(object_integrated,logfc.threshold = 0,only.pos = T)
+
+object_integrated$region <- plyr::mapvalues(
+  object_integrated$seurat_clusters,
+  from = 0:18,
+  to = c("InjPT", "PTS1", "PTS1S2", "PTS1S2", "DT", 
+         "InjPT", "IOM", "CNT_CD", "RC", "CMJ", "PTS2", "Glom", "Niche1", "Niche2", 
+         "ALOH(C)", "CMJ", "IOM", "IM", "Perirenal"))
+
+object_integrated$structure <- plyr::mapvalues(
+  object_integrated$region,
+  from =  c( "Glom","PTS1", "PTS1S2", "PTS2", "InjPT","ALOH(C)",  "DT", "CNT_CD", 
+             "CMJ",  "Niche1", "Niche2", "IOM",  "IM","RC",  "Perirenal"),
+  to = c( "Cortex","Cortex", "Cortex", "Cortex", "Cortex","Cortex",  "Cortex", "Cortex",  
+          "Outer Stripe of Outer Medulla",
+          "Niche1",  "Niche2", 
+          "Inner Stripe of Outer Medulla", "Inner Medulla","Renal Capsule",  "Perirenal")
+)
+
+objects_list<- list(
+  object_integrated = object_integrated,
+  st.marker = st.marker,
+  spatial_each_sem = spatial_each_sem)
+saveRDS(object = objects_list,file = "~/TNC/VisiumUIRI/VisiumUIRI.rds")
+```
+
+
+#### 3) Deconvolution Using RCTD
+
+```{r}
+scRNA <- readRDS('~/TNC/scRNA_UIRI/sce_ann.rds') # Pre-annotated UIRI scRNA-seq Reference
+
+objects_list <- readRDS("~/TNC/VisiumUIRI/VisiumUIRI.rds")
+TNC_elements <- objects_list$spatial_each_sem
+
+for (i in 1:length(TNC_elements)) {
+  sem <- TNC_elements[[i]]
+  sem <- run_deconvolution(scRNA = scRNA,sc_ident = "celltype",stRNA = sem, method = "RCTD",RCTD_mode = "full") 
+  sem[["RCTD"]] <- CreateAssayObject(data = t(sem@misc$RCTD$norm_weights))
+  TNC_elements[[i]] <- sem
+}
+
+saveRDS(TNC_elements, file = "~/TNC/VisiumUIRI/RCTD_UIRI.rds")
+```
+
+#### 4) NMF Analysis -- a computational tool for identifying gene expression modules
+
+```{r}
+objects_list <- readRDS("~/TNC/VisiumUUO/VisiumUIRI.rds")
+object_integrated <- objects_list$object_integrated
+
+nmf <- singlet::RunNMF(object_integrated, assay = "integrated")
+
+singlet::RankPlot(nmf, reduction = "nmf")  
+DotPlot(object_integrated,features = colnames(object_integrated@reductions[["nmf"]]@cell.embeddings),group.by = "region")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+#### 5) CellChat for Spatial Communication Analysis
+
+```{r}
+spaCellChat <- function(sem,
+                          myident,
+                          species, 
+                          type = "truncatedMean",  trim = 0.1,
+                          interaction.range = 250,
+                          distance.use = TRUE, 
+                          scale.distance = 0.01,
+                          contact.dependent.forced = FALSE,
+                          contact.dependent = TRUE,
+                          contact.range = 100,
+                          mincell = 10){
+    library(CellChat)
+    library(Seurat)
+    library(tidyverse)
+    library(patchwork)
+    library(dplyr)
+    
+    sem$region <- sem@meta.data[,myident]
+    if (is.factor(sem$region)) {
+      sem$region <- droplevels(sem$region)
+    }
+    Idents(sem) <- "region"
+    
+    #count meta
+    data.input = Seurat::GetAssayData(sem, layer = "data", assay = "SCT") 
+    meta = data.frame(labels = Idents(sem),row.names = names(Idents(sem)))
+    
+    #location
+    coords <- sem@tools$Staffli@meta_data[, c("pxl_col_in_fullres", "pxl_row_in_fullres")] %>% as.data.frame()
+    rownames(coords) <- sem@tools$Staffli@meta_data$barcode 
+    colnames(coords) <- c("imagerow", "imagecol")
+    spatial.locs <- coords[rownames(sem@meta.data),]
+    
+    #scalefactor
+    scalefactors = jsonlite::fromJSON(txt = file.path(dirname(sem@tools$Staffli@imgs), "scalefactors_json.json"))
+    spot.size = 65        #10X Visium spot大小为55μm，两个spot之间Gap为10μm
+    conversion.factor = spot.size/scalefactors$spot_diameter_fullres
+    spatial.factors = data.frame(ratio = conversion.factor, tol = spot.size/2)
+    
+    interaction_input <- read.csv(file = "~/TNC/database/interaction_input_CellChatDB.csv", row.names = 1)
+    complex_input <- read.csv(file = "~/TNC/database/complex_input_CellChatDB.csv", row.names = 1)
+    cofactor_input <- read.csv(file = "~/TNC/database/cofactor_input_CellChatDB.csv", row.names = 1)
+    geneInfo <- read.csv(file = "~/TNC/database/geneInfo_input_CellChatDB.csv", row.names = 1)
+    CellChatDB <- list()
+    CellChatDB$interaction <- interaction_input
+    CellChatDB$complex <- complex_input
+    CellChatDB$cofactor <- cofactor_input
+    CellChatDB$geneInfo <- geneInfo
+    CellChatDB.mouse <- CellChatDB
+    
+    #createCellChat
+    cellchat <- createCellChat(object = data.input, 
+                               meta = meta, 
+                               group.by = "labels",     
+                               datatype = "spatial",  
+                               coordinates = spatial.locs, 
+                               spatial.factors = spatial.factors)
+    
+    CellChatDB <- CellChatDB.mouse 
+    cellchat@DB <- CellChatDB
+    
+    
+    cellchat <- subsetData(cellchat)
+    
+    future::plan("sequential") 
+    
+    cellchat <- identifyOverExpressedGenes(cellchat)
+    cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = F)
+    
+    cellchat <- computeCommunProb(cellchat, type = type, 
+                                  trim = trim,
+                                  distance.use = distance.use, 
+                                  interaction.range = interaction.range, 
+                                  scale.distance = scale.distance,
+                                  contact.dependent = contact.dependent, 
+                                  contact.range = contact.range)
+    
+    cellchat <- filterCommunication(cellchat, min.cells = mincell)
+    cellchat <- computeCommunProbPathway(cellchat)
+    cellchat <- aggregateNet(cellchat)
+    cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "net")
+    cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+    
+    df.net <- subsetCommunication(cellchat)  #配受体对
+    df.netP <- subsetCommunication(cellchat, slot.name = "netP")
+    
+    return(list(cellchat = cellchat,
+                df.net = df.net,
+                df.netP = df.netP))
+}
+
+sem <- spatial_list$UIRI
+cellchat_obj <- spaCellChat(sem, myident = "region", species = "mouse")
+cellchat <- cellchat_obj$cellchat
+
+pals <- paletteer_c("ggthemes::Orange-Blue-White Diverging",100) %>% rev()
+h1 <- netVisual_heatmap(cellchat, measure = "count", my_color = pals)
+h2 <- netVisual_heatmap(cellchat, measure = "weight", my_color = pals)
+h1 + h2
+
+pathways.show <- c("TENASCIN")
+netVisual_individual(cellchat, 
+                     pairLR.use = "TNC_TLR4",
+                     signaling = pathways.show,
+                     layout = "circle")
+
+```
+
+
+### 1. Processing of UUO Data
+#### 1) Visium Data Preprocessing
+```{r}
+path <- c('~TNC/Visium/GSE273978_UUO/Sham',
+          '~TNC/Visium/GSE273978_UUO/UUO1',
+          "~TNC/Visium/GSE273978_UUO/UUO2",
+          '~TNC/Visium/GSE273978_UUO/UUO3')
+sample <- c("Sham","UUO1","UUO2","UUO3")
+
+spatial_each_sem <- list()
+for (i in 1:length(path)) {
+  sem <- read_10x_with_semla(path = path[i],sample_names = sample[i])
+  sem <- semla::SubsetSTData(sem, nFeature_Spatial > 1000)
+  sem <- spfunction(sem)
+  spatial_each_sem[[sample[i]]] <- sem
+}
+
+sem_list <- list()
+for (i in seq_along(path)) {
+  sem <- read_10x_with_semla(path = path[i], sample_names = sample[i])
+  sem <- semla::SubsetSTData(sem, nFeature_Spatial > 1000)
+  
+  sem <- NormalizeData(sem, verbose = FALSE)
+  sem <- FindVariableFeatures(sem, verbose = FALSE)
+  
+  sem_list[[sample[i]]] <- sem
+}
+
+anchors <- FindIntegrationAnchors(object.list = sem_list, dims = 1:20)
+object_integrated <- IntegrateData(anchorset = anchors, dims = 1:20)
+object_integrated <- ScaleData(object_integrated, verbose = FALSE)
+object_integrated <- RunPCA(object_integrated, verbose = FALSE)
+object_integrated <- RunUMAP(object_integrated, dims =1:20)
+object_integrated <- FindNeighbors(object_integrated, reduction = "pca", dims = 1:20)
+object_integrated <- FindClusters(object_integrated, verbose = FALSE, resolution = 0.8)
+
+```
+
+#### 2) Region Annotation
+
+```{r}
+st.marker <- FindAllMarkers(object_integrated,logfc.threshold = 0,only.pos = T)
+
+object_integrated$region <- plyr::mapvalues(object_integrated$seurat_clusters,
+                                            from = 0:16,
+                                            to = c("PTS2", "IM", "DT", "InjPT/DT", "Fibrogenic Niche", 
+                                                   "LOH", "PTS3", "PTS3","InjPTS3", "InjPT",
+                                                   "LOH", "Vasculature", "PTS1","Glomerulus", "Fibrogenic Niche", 
+                                                   "LOH", "RC"))
+
+object_integrated$structure <- plyr::mapvalues(
+  object_integrated$region,
+  from = c("Glomerulus", "PTS1", "PTS2", "PTS3", 
+           "InjPT", "InjPTS3", "InjPT/DT",
+           "DT","LOH","IM",
+           "Fibrogenic Niche", "Vasculature", "RC"),
+  to = c("Cortex", "Cortex", "Cortex", "Outer Stripe of Outer Medulla",
+         "Cortex", "Outer Stripe of Outer Medulla", "Cortex",
+         "Cortex", "Inner Stripe of Outer Medulla", "Inner Medulla",
+         "Fibrogenic Niche", "Cortex", "Renal Capsule")
+)
+
+setwd('~/TNC/VisiumUUO')
+objects_list<- list(
+  object_integrated = object_integrated,
+  st.marker = st.marker,
+  spatial_each_sem = spatial_each_sem
+)
+
+saveRDS(object = objects_list,file = "~/TNC/VisiumUUO/VisiumUUO.rds")
+```
+
+#### 3) Deconvolution Using RCTD
+
+```{r}
+scRNA <- readRDS("~/TNC/scRNA_UUO/UUO.rds") # Pre-annotated UUO scRNA-seq Reference
+
+###反卷积
+objects_list <- readRDS("~/TNC/VisiumUUO/VisiumUUO.rds")
+TNC_elements <- objects_list$spatial_each_sem
+semMerged <- objects_list$se
+
+for (i in 1:length(TNC_elements)) {
+  sem <- TNC_elements[[i]]
+  sem <- run_deconvolution(scRNA = scRNA,sc_ident = "celltype",stRNA = sem, method = "RCTD",RCTD_mode = "full") 
+  sem[["RCTD"]] <- CreateAssayObject(data = t(sem@misc$RCTD$norm_weights))
+  TNC_elements[[i]] <- sem
+}
+
+saveRDS(TNC_elements, file = "~/TNC/VisiumUUO/RCTD_UUO.rds")
+```
+
+#### 4) NMF Analysis -- a computational tool for identifying gene expression modules
+
+```{r}
+objects_list <- readRDS("~/TNC/VisiumUUO/VisiumUUO.rds")
+object_integrated <- objects_list$object_integrated
+
+nmf <- singlet::RunNMF(object_integrated, assay = "integrated")
+
+singlet::RankPlot(nmf, reduction = "nmf")  
+DotPlot(object_integrated,features = colnames(object_integrated@reductions[["nmf"]]@cell.embeddings),group.by = "region")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```

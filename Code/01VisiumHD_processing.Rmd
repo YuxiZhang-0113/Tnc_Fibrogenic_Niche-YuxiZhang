@@ -1,0 +1,166 @@
+---
+title: "01VisiumHD_processing"
+author: "Yuxi Zhang"
+date: "2025-08-09"
+output: html_document
+---
+
+## VisiumHD Data Processing
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(Azimuth)
+library(ggplot2)
+library(patchwork)
+library(scCustomize)
+library(SpatialExperiment)
+library(stringr)
+library(semla)
+library(dplyr)
+options(future.globals.maxSize = 1e9)
+```
+
+### 1.VisiumHD Data Preprocessing
+
+```{r setup, include=FALSE}
+data_root_directory <- c('~/TNC/VisiumHD/Control/binned_outputs/square_016um',
+                         '~/TNC/VisiumHD/UIRI10D/binned_outputs/square_016um')
+sample_names <- c("Control","UIRI10D")
+
+semHD_list <- list()
+for (i in 1:length(data_root_directory)) {
+  samples <- Sys.glob(paths = file.path(data_root_directory[i],  "filtered_feature_bc_matrix.h5"))
+  imgs <- Sys.glob(paths = file.path(data_root_directory[i],  "spatial", "tissue_hires_image.png"))
+  spotfiles <- Sys.glob(paths = list.files(file.path(data_root_directory[i], "spatial"), pattern = "^tissue_positions", full.names = TRUE)[1])
+  json <- Sys.glob(paths = file.path(data_root_directory[i], "spatial", "scalefactors_json.json"))
+  infoTable <- tibble(samples, imgs, spotfiles, json,sample_ID = sample_names[i])
+  
+  se.16 <- ReadVisiumData(infoTable)
+  se.16 <- semla::LoadImages(se.16)  
+  se.16[['percent.mt']] <- PercentageFeatureSet(object = se.16, pattern = '^mt-')
+  se.16 <- subset(se.16, subset = nFeature_Spatial >= 150 & percent.mt <= 40)
+  
+  se.16 <-  se.16 |>
+    NormalizeData() |>
+    ScaleData() |>
+    FindVariableFeatures() |>
+    RunPCA() |>
+    FindNeighbors(reduction = "pca", dims = 1:30) |>
+    FindClusters(resolution = 0.8) |>
+    RunUMAP(reduction = "pca", dims =  1:30)
+  
+  semHD_list[[sample_names[i]]] <- se.16
+  
+}
+
+saveRDS(semHD_list, file = "~/TNC/VisiumHD/semHD_list.rds")
+```
+
+### 2.Sample Integration
+
+```{r}
+spatial_each_sem <- readRDS("~/TNC/VisiumHD/semHD_list.rds")
+
+obj <- scCustomize::Merge_Seurat_List(spatial_each_sem,add.cell.ids = names(spatial_each_sem))
+obj$sample <- obj$orig.ident
+
+obj <-  obj |>
+  NormalizeData() |>
+  ScaleData() |>
+  FindVariableFeatures() |>
+  RunPCA()
+
+obj <- IntegrateLayers(
+  object = obj, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+
+obj <- FindNeighbors(obj, reduction = "integrated.cca", dims = 1:30)
+obj <- FindClusters(obj, resolution = 0.8, cluster.name = "cca_clusters")
+obj <- RunUMAP(obj, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+obj <- JoinLayers(obj)
+```
+
+### 3.Region Annotation
+
+```{r}
+st.marker <- FindAllMarkers(obj,logfc.threshold = 0,only.pos = T)
+
+object_integrated$region <- plyr::mapvalues(
+  object_integrated$seurat_clusters,
+  from = 0:22,
+  to = c("LOH(IOM)", "PTS3", "Fibrogenic Niche", "PTS2", "tALOH(IM)", "PTS1S2",
+         "Vasa recta", "InjPT", "CD(IM)", "CD(IOM)", "PTS1",
+         "ALOH(Cortex)", "Perirenal Fibrous","InjPTS3", "DT_CNT", "Perirenal Adipose",
+         "CNT_CD", "DT_CNT","Glomerulus", "RC", "CD(Cortex)",
+         "ALOH(Cortex)","Vasculature")
+)
+object_integrated$structure <- plyr::mapvalues(
+  object_integrated$region,
+  from = c("Glomerulus", "PTS1", "PTS2", "PTS1S2","PTS3", 
+           "InjPT", "InjPTS3", "ALOH(Cortex)", "tALOH(IM)", "LOH(IOM)",
+           "DT_CNT","CD(Cortex)","CD(IOM)","CD(IM)","CNT_CD", 
+           "Fibrogenic Niche","Vasa recta", "Vasculature", "RC", "Perirenal Fibrous", "Perirenal Adipose"),
+  to = c("Cortex", "Cortex", "Cortex", "Cortex",  "Outer Stripe of Outer Medulla",
+         "Cortex", "Outer Stripe of Outer Medulla","Cortex","Inner Medulla","Inner Stripe of Outer Medulla",
+         "Cortex", "Cortex", "Inner Stripe of Outer Medulla","Inner Medulla","Cortex",
+         "Fibrogenic Niche", "Inner Stripe of Outer Medulla","Vasculature","Renal Capsule","Perirenal","Perirenal")
+)
+
+
+
+semMerged <- semla::MergeSTData(spatial_each_sem[[1]],spatial_each_sem[[2]])
+semMerged$region <- factor(semMerged$region,
+                           levels = c("Glomerulus", "Vasculature","PTS1", "PTS2", "PTS1S2",
+                                      "InjPT", "ALOH(Cortex)","DT_CNT","CNT_CD", "CD(Cortex)",
+                                      "PTS3",  "InjPTS3","Fibrogenic Niche", 
+                                      "Vasa recta","LOH(IOM)", "CD(IOM)",
+                                      "CD(IM)","tALOH(IM)",
+                                      "RC", "Perirenal Fibrous", "Perirenal Adipose"))
+
+objects_list <- list(
+  obj = obj,
+  st_marker = st.marker,
+  spatial_each_sem = spatial_each_sem
+)
+
+saveRDS(objects_list, file = "~/TNC/VisiumHD/HD_merged_list.rds")
+```
+
+### 4.Deconvolution Using RCTD
+
+```{r}
+scRNA <- readRDS(('~/TNC/scRNA_UIRI/sce_ann.rds')) # Pre-annotated scRNA-seq Reference for VisiumHD Deconvolution
+
+TNC_elements <- readRDS("~/TNC/VisiumHD/semHD_list.rds")
+
+for (i in 1:length(TNC_elements)) {
+  sem <- TNC_elements[[i]]
+  sem <- run_deconvolution(scRNA = scRNA,sc_ident = "celltype",stRNA = sem, method = "RCTD",RCTD_mode = "doublet") # Deconvolution in doublet mode
+  sem[["RCTD"]] <- CreateAssayObject(data = t(sem@misc$RCTD$norm_weights))
+  TNC_elements[[i]] <- sem
+}
+
+saveRDS(TNC_elements, file = "~/TNC/VisiumHD/RCTD_HD.rds")
+
+```
+
+
+### 5.NMF Analysis -- a computational tool for identifying gene expression modules
+
+```{r}
+objects_list <- readRDS("~/TNC/VisiumHD/HD_merged_list.rds")
+object_integrated <- objects_list$obj
+
+object_integrated  <-  singlet::RunNMF(object_integrated, assay = "Spatial")
+
+singlet::RankPlot(object_integrated, reduction = "nmf") 
+
+DotPlot(object_integrated,features = colnames(object_integrated@reductions[["nmf"]]@cell.embeddings),group.by = "region")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
