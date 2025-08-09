@@ -19,7 +19,7 @@ for sample in *_S1_L001_R1_001.fastq.gz; do
 
     fastq_files_to_delete=("${sample_id}"*.fastq.gz)
     for file in "${fastq_files_to_delete[@]}"; do
-        echo "正在删除 $file..."
+        echo "Deleting $file..."
         rm "$file"
     done
 done
